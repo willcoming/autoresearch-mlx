@@ -1,0 +1,54 @@
+//@version=6
+strategy("S06 Strategy", overlay=true, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// --- 設定與變數 ---
+len5    = 5
+len10   = 10
+len20   = 20
+len60   = 60
+len200  = 200
+
+rsiLength      = 14
+rsiOversold    = 30
+rsiOverbought  = 70
+
+zlsma_length   = 30
+
+// --- 指標計算 ---
+ema5   = ta.ema(close, len5)
+ema10  = ta.ema(close, len10)
+ema20  = ta.ema(close, len20)
+ema60  = ta.ema(close, len60)
+ema200 = ta.ema(close, len200)
+
+rsi = ta.rsi(close, rsiLength)
+
+// MACD 計算
+[_, _, macdHist] = ta.macd(close, 12, 26, 9)
+
+// MACD 趨勢判斷
+macdBull = (macdHist > 0 and macdHist[1] < 0) or 
+           (macdHist > macdHist[1] and macdHist[1] > macdHist[2] and macdHist[2] > macdHist[3])
+
+// 零滯後移動平均線 (ZLSMA)
+zlsma = 2 * ta.sma(close, zlsma_length) - ta.sma(ta.sma(close, zlsma_length), zlsma_length)
+
+// --- 訊號條件 ---
+rsiExitOversold    = ta.crossover(rsi, rsiOversold)
+rsiExitOverbought  = ta.crossunder(rsi, rsiOverbought)
+priceBreakoutZlsma = ta.crossover(close, zlsma)
+
+// 連續兩天陰線 (收盤 < 開盤)
+consecutive2DayDown = close < open and close[1] < open[1]
+
+// 進場與出場邏輯
+entryCondition = macdBull and rsiExitOversold and priceBreakoutZlsma
+exitCondition  = rsiExitOverbought and consecutive2DayDown
+
+// --- 執行策略 ---
+if exitCondition and strategy.position_size > 0
+    strategy.close("Long", comment="Exit")
+
+if entryCondition and strategy.position_size <= 0 and not exitCondition
+    strategy.entry("Long", strategy.long, comment="Entry")
+

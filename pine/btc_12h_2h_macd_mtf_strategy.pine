@@ -1,0 +1,45 @@
+//@version=6
+strategy("BTC HTF / LTF MACD MTF Strategy", overlay=true, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, process_orders_on_close=true)
+higherTfLabel = input.string("12H", "HTF", options=["5m", "15m", "30m", "1H", "2H", "4H", "8H", "12H", "1D", "1W", "1M"])
+lowerTfLabel = input.string("2H", "LTF", options=["5m", "15m", "30m", "1H", "2H", "4H", "8H", "12H", "1D", "1W", "1M"])
+fastLength = input.int(12, "MACD Fast", minval=1)
+slowLength = input.int(26, "MACD Slow", minval=1)
+signalLength = input.int(9, "MACD Signal", minval=1)
+tfValue(tfLabel) => tfLabel == "5m" ? "5" : tfLabel == "15m" ? "15" : tfLabel == "30m" ? "30" : tfLabel == "1H" ? "60" : tfLabel == "2H" ? "120" : tfLabel == "4H" ? "240" : tfLabel == "8H" ? "480" : tfLabel == "12H" ? "720" : tfLabel == "1D" ? "1D" : tfLabel == "1W" ? "1W" : "1M"
+higherTf = tfValue(higherTfLabel)
+lowerTf = tfValue(lowerTfLabel)
+validTfPair = timeframe.in_seconds(higherTf) > timeframe.in_seconds(lowerTf)
+chartMatchesLtf = timeframe.in_seconds() == timeframe.in_seconds(lowerTf)
+calcMacdHist(src) =>
+    [_, _, hist] = ta.macd(src, fastLength, slowLength, signalLength)
+    hist
+macdBullFromHist(hist) => ta.crossover(hist, 0) or (hist > hist[1] and hist[1] > hist[2] and hist[2] > hist[3])
+macdBearFromHist(hist) => ta.crossunder(hist, 0) or (hist < hist[1] and hist[1] < hist[2] and hist[2] < hist[3])
+macdRegimeFromHist(hist) =>
+    bull = macdBullFromHist(hist)
+    bear = macdBearFromHist(hist)
+    bullBarsAgo = ta.barssince(bull)
+    bearBarsAgo = ta.barssince(bear)
+    bullActive = not na(bullBarsAgo) and (na(bearBarsAgo) or bullBarsAgo < bearBarsAgo)
+    bearActive = not na(bearBarsAgo) and (na(bullBarsAgo) or bearBarsAgo < bullBarsAgo)
+    bullActive ? 1 : bearActive ? -1 : 0
+macdHistLtf = calcMacdHist(close)
+macdBullLtf = macdBullFromHist(macdHistLtf)
+macdBearLtf = macdBearFromHist(macdHistLtf)
+regimeHtf = request.security(syminfo.tickerid, higherTf, macdRegimeFromHist(calcMacdHist(close)), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+bullRegimeHtf = regimeHtf == 1
+bearRegimeHtf = regimeHtf == -1
+longTrigger = validTfPair and chartMatchesLtf and bullRegimeHtf and macdBullLtf
+longExitSignal = validTfPair and chartMatchesLtf and strategy.position_size > 0 and macdBearLtf
+bgcolor(bullRegimeHtf ? color.new(color.green, 85) : na, title="HTF Bull Regime")
+bgcolor(bearRegimeHtf ? color.new(color.red, 85) : na, title="HTF Bear Regime")
+plotshape(longTrigger, title="Long Trigger", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), text="L", textcolor=color.white, size=size.small)
+plotshape(longExitSignal, title="Long Exit", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+var table warningTable = table.new(position.top_right, 1, 1)
+if barstate.islast
+    table.cell(warningTable, 0, 0, validTfPair ? chartMatchesLtf ? "" : "Use this strategy on a " + lowerTfLabel + " chart" : "HTF must be higher than LTF", text_color=validTfPair and chartMatchesLtf ? color.new(color.white, 100) : color.black, bgcolor=validTfPair and chartMatchesLtf ? color.new(color.black, 100) : color.new(color.yellow, 0))
+if validTfPair and chartMatchesLtf
+    if strategy.position_size > 0 and macdBearLtf
+        strategy.close("Long", comment="LTF Bear Exit")
+    if longTrigger and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, comment="HTF Bull Long")

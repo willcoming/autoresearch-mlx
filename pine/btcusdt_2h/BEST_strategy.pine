@@ -1,0 +1,34 @@
+//@version=6
+strategy("BTCUSDT 2H BEST Strategy", overlay=true, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// --- 設定與變數 ---
+rsiLength   = 14
+rsiOversold = 30
+
+// --- 指標計算 ---
+rsi = ta.rsi(close, rsiLength)
+
+// MACD 計算
+[_, _, macdHist] = ta.macd(close, 12, 26, 9)
+
+// MACD 趨勢判斷
+macdBull = (macdHist > 0 and macdHist[1] < 0) or 
+           (macdHist > macdHist[1] and macdHist[1] > macdHist[2] and macdHist[2] > macdHist[3])
+
+macdBear = (macdHist < 0 and macdHist[1] > 0) or 
+           (macdHist < macdHist[1] and macdHist[1] < macdHist[2] and macdHist[2] < macdHist[3])
+
+// --- 訊號條件 ---
+rsiExitOversold = ta.crossover(rsi, rsiOversold)
+
+// 進場與出場邏輯
+entryCondition = macdBull and rsiExitOversold
+exitCondition  = macdBear
+
+// --- 執行策略 ---
+if exitCondition and strategy.position_size > 0
+    strategy.close("Long", comment="Exit")
+
+if entryCondition and strategy.position_size <= 0 and not exitCondition
+    strategy.entry("Long", strategy.long, comment="Entry")
+

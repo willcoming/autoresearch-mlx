@@ -1,0 +1,32 @@
+//@version=6
+strategy("BTCUSDT 2H S03 Strategy", overlay=true, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// --- 設定與變數 ---
+rsiLength   = 14
+rsiOversold = 30
+zlsmaLength = 20
+
+// --- 指標計算 ---
+rsi = ta.rsi(close, rsiLength)
+
+// 零滯後移動平均線 (ZLSMA)
+zlsma = 2 * ta.sma(close, zlsmaLength) - ta.sma(ta.sma(close, zlsmaLength), zlsmaLength)
+
+// --- 訊號條件 ---
+rsiExitOversold    = ta.crossover(rsi, rsiOversold)
+priceBreakoutZlsma = ta.crossover(close, zlsma)
+
+// 形態判斷
+twoBearishBars = close < open and close[1] < open[1]
+
+// 進場與出場邏輯
+entryCondition = rsiExitOversold and priceBreakoutZlsma
+exitCondition  = twoBearishBars
+
+// --- 執行策略 ---
+if exitCondition and strategy.position_size > 0
+    strategy.close("Long", comment="Exit")
+
+if entryCondition and strategy.position_size <= 0 and not exitCondition
+    strategy.entry("Long", strategy.long, comment="Entry")
+

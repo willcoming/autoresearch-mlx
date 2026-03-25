@@ -1,0 +1,150 @@
+//@version=6
+indicator("K線排列指標", overlay=true)
+
+// === 參數設定 ===
+len5     = input.int(5, "EMA 5 (快)")
+len10    = input.int(10, "EMA 10 (慢)")
+len20    = input.int(20, "EMA 20 (中)")
+len60    = input.int(60, "EMA 60")
+len200   = input.int(200, "EMA 200 (趨勢)")
+
+// === 策略參數 ===
+rsiOverbought = input.int(70, "RSI 超買", group="策略設定")
+rsiOversold = input.int(30, "RSI 超賣", group="策略設定")
+
+// === 指標計算 ===
+// 使用當前時間框架的收盤價
+float c = close
+
+ema5   = ta.ema(c, len5)
+ema10  = ta.ema(c, len10)
+ema20  = ta.ema(c, len20)
+ema60  = ta.ema(c, len60)
+ema200 = ta.ema(c, len200)
+
+
+// RSI 設定 (保留但可選)
+rsiLength = input.int(14, "RSI 長度")
+rsi = ta.rsi(close, rsiLength)
+// plot(rsi, title="RSI", color=color.new(color.purple, 0))
+
+// === MACD 計算 ===
+[_, _, macdHist] = ta.macd(close, 12, 26, 9)
+macdBull = (macdHist > 0 and macdHist[1] < 0) or 
+           (macdHist > macdHist[1] and 
+            macdHist[1] > macdHist[2] and 
+            macdHist[2] > macdHist[3])
+
+macdBear = (macdHist < 0 and macdHist[1] > 0) or 
+           (macdHist < macdHist[1] and 
+            macdHist[1] < macdHist[2] and 
+            macdHist[2] < macdHist[3])
+
+// ---- ZLSMA 輸入參數 ----
+zlsma_length = input.int(20, "ZLSMA 長度 (趨勢)")
+// ZLSMA (零延遲平滑移動平均線)
+zlsma = 2 * ta.sma(close, zlsma_length) - ta.sma(ta.sma(close, zlsma_length), zlsma_length)
+
+// ---- RS Line 參數 (參考 台股K線排列指標) ----
+rsBenchmarkSymbol = input.string("Index:TAIEX", "基準指數", options=["Index:TAIEX", "SPX500", "CRYPTOCAP:BTC", "CRYPTOCAP:ETH"], group="RS Line設定")
+rsLineEmaLength = input.int(21, "RS Line EMA週期", minval=1, group="RS Line設定")
+rsBenchmarkTimeframe = input.timeframe("D", "RS Line 基準週期", group="RS Line設定")
+
+
+// === RS Line 計算 ===
+benchmarkClose = request.security(rsBenchmarkSymbol, rsBenchmarkTimeframe, close)
+rsLine = benchmarkClose != 0 ? close / benchmarkClose : na
+rsLineEma = ta.ema(rsLine, rsLineEmaLength)
+rsLineValid = not na(rsLine) and not na(rsLineEma)
+rsLineAbove = rsLineValid and rsLine > rsLineEma
+
+// === 定義變數以支援背景與信號 ===
+rsLineCrossOver = ta.crossover(rsLine, rsLineEma)
+rsLineCrossUnder = ta.crossunder(rsLine, rsLineEma)
+
+// 背景顏色設定 - 基於 EMA60 和 ZLSMA 趨勢
+ema60Up = ema60 > ema60[1]
+zlsmaUp = zlsma > zlsma[1]
+ema60Down = ema60 < ema60[1]
+zlsmaDown = zlsma < zlsma[1]
+
+// 同時向上為紅色，同時向下為綠色
+bothUp = ema60Up and zlsmaUp
+bothDown = ema60Down and zlsmaDown
+bgColor = bothUp ? color.new(color.red, 80) : bothDown ? color.new(color.green, 80) : na
+bgcolor(bgColor, title="趨勢背景")
+
+// MACD 標註（修正重複）
+plotshape(macdBull, title="MACD Bull 買入訊號", style=shape.labelup,   location=location.belowbar, color=color.red,  size=size.small)
+plotshape(macdBear, title="MACD Bear 賣出訊號", style=shape.labeldown, location=location.abovebar, color=color.lime, size=size.small)
+
+// 在圖表上標記買賣信號
+plotshape(rsLineCrossOver, title="Check買進信號", location=location.belowbar, color=color.orange, style=shape.triangleup, size=size.small)
+// plotshape(rsLineCrossUnder, title="Check賣出進信號", location=location.abovebar, color=color.orange, style=shape.triangledown, size=size.small)
+
+
+// === EMA 5 上穿 EMA 10 標記 ===
+ema5CrossOver10 = ta.crossover(ema5, ema10)
+plotshape(ema5CrossOver10, title="EMA 5 CrossOver 10", style=shape.labelup, location=location.belowbar, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+// === EMA 5 下穿 EMA 10 標記 ===
+ema5CrossUnder10 = ta.crossunder(ema5, ema10)
+plotshape(ema5CrossUnder10, title="EMA 5 CrossUnder 10", style=shape.labeldown, location=location.abovebar, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+// === RSI 超買超賣結束標記 ===
+// RSI 從超賣區回升 (RSI 上穿 30)
+rsiExitOversold = ta.crossover(rsi, rsiOversold)
+plotshape(rsiExitOversold, title="RSI 超賣結束", style=shape.circle, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny)
+
+// RSI 從超買區回落 (RSI 下穿 70)
+rsiExitOverbought = ta.crossunder(rsi, rsiOverbought)
+plotshape(rsiExitOverbought, title="RSI 超買結束", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// === 連續第2天上漲標記 (close > open) ===
+// 判斷當前K線是否為陽線 (收盤價 > 開盤價)
+isBullishCandle = close > open
+// 判斷前一根K線是否為陽線
+wasBullishCandle = close[1] > open[1]
+// 連續2天上漲
+consecutive2DayUp = isBullishCandle and wasBullishCandle
+
+// === 連續第2天下跌標記 (close < open) ===
+// 判斷當前K線是否為陰線 (收盤價 < 開盤價)
+isBearishCandle = close < open
+// 判斷前一根K線是否為陰線
+wasBearishCandle = close[1] < open[1]
+// 連續2天下跌
+consecutive2DayDown = isBearishCandle and wasBearishCandle
+
+// 標記連續2天上漲/下跌 - 直接在K線上顯示顏色
+barcolor(consecutive2DayUp ? color.orange : consecutive2DayDown ? color.purple : na, title="連續2天上漲/下跌")
+
+
+
+
+// === 視覺化 ===
+plot(ema5,   title="EMA 5",   color=color.new(color.blue, 0), linewidth=2)
+plot(ema10,  title="EMA 10",  color=color.new(color.orange, 0), linewidth=2)
+plot(ema20,  title="EMA 20",  color=color.new(color.yellow, 0), linewidth=2)
+plot(ema60,  title="EMA 60",  color=color.new(color.red, 0), linewidth=2)
+plot(ema200, title="EMA 200", color=color.new(color.green, 0), linewidth=3)
+plot(zlsma,  title="ZLSMA",   color=color.new(color.white, 0), linewidth=3)
+
+
+
+
+// plotshape(longCondition, "Long", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.small)
+// plotshape(shortCondition, "Short", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// 背景變紅色警報 (只在剛轉成紅色時觸發)
+bgTurnRed = bothUp and not bothUp[1]
+
+// === 價格突破 ZLSMA ===
+priceBreakoutZlsma = ta.crossover(close, zlsma)
+priceBreakdownZlsma = ta.crossunder(close, zlsma)
+
+plotshape(priceBreakoutZlsma, title="ZLSMA 上穿", style=shape.labelup, location=location.belowbar, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny, text="Z")
+plotshape(priceBreakdownZlsma, title="ZLSMA 下穿", style=shape.labeldown, location=location.abovebar, color=color.new(color.green, 0), textcolor=color.white, size=size.tiny, text="Z")
+
+alertcondition(macdBull, title="MACD Bull Alert", message="MACD Bull 買入訊號出現！")
+alertcondition(macdBear, title="MACD Bear Alert", message="MACD Bear 賣出訊號出現！")
