@@ -1,0 +1,60 @@
+//@version=6
+strategy(
+    "BTCUSDT 5m BEST Strategy",
+    overlay=true,
+    pyramiding=0,
+    default_qty_type=strategy.percent_of_equity,
+    default_qty_value=100,
+    commission_type=strategy.commission.percent,
+    commission_value=0.1,
+    process_orders_on_close=true
+)
+
+// 最佳化結果來自 btc/btc_results.tsv 的最後一次 keep：
+// Sharpe 3.0025 / Profit Factor 7.7828 / Win Rate 78.57%
+// Max Drawdown 6.84% / Total Return 38.88% / Trades 14
+
+// === Strategy Parameters ===
+rsiLength = input.int(15, "RSI Length", minval=1, group="Parameters")
+rsiOversold = input.int(30, "RSI Oversold", minval=1, maxval=99, group="Parameters")
+rsiOverbought = input.int(70, "RSI Overbought", minval=1, maxval=99, group="Parameters")
+zlsmaLength = input.int(30, "ZLSMA Length", minval=1, group="Parameters")
+macdFast = input.int(12, "MACD Fast", minval=1, group="Parameters")
+macdSlow = input.int(26, "MACD Slow", minval=1, group="Parameters")
+macdSignal = input.int(9, "MACD Signal", minval=1, group="Parameters")
+showMarkers = input.bool(true, "Show Markers", group="Display")
+showZlsma = input.bool(true, "Show ZLSMA", group="Display")
+
+// === Indicators ===
+rsi = ta.rsi(close, rsiLength)
+[_, _, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+zlsma = 2 * ta.sma(close, zlsmaLength) - ta.sma(ta.sma(close, zlsmaLength), zlsmaLength)
+
+// === Signal Logic ===
+macdBull = (macdHist > 0 and macdHist[1] < 0) or
+           (macdHist > macdHist[1] and macdHist[1] > macdHist[2] and macdHist[2] > macdHist[3])
+
+macdBear = (macdHist < 0 and macdHist[1] > 0) or
+           (macdHist < macdHist[1] and macdHist[1] < macdHist[2] and macdHist[2] < macdHist[3])
+
+rsiExitOversold = ta.crossover(rsi, rsiOversold)
+rsiExitOverbought = ta.crossunder(rsi, rsiOverbought)
+priceBreakoutZlsma = ta.crossover(close, zlsma)
+
+entryCondition = macdBull and rsiExitOversold and priceBreakoutZlsma
+exitCondition = macdBear and rsiExitOverbought
+
+// === Orders ===
+if exitCondition and strategy.position_size > 0
+    strategy.close("Long", comment="MACD Bear + RSI Exit OB")
+
+if entryCondition and strategy.position_size <= 0 and not exitCondition
+    strategy.entry("Long", strategy.long, comment="MACD Bull + RSI Exit OS + ZLSMA BO")
+
+// === Visuals ===
+plot(showZlsma ? zlsma : na, title="ZLSMA", color=color.new(color.white, 0), linewidth=2)
+plotshape(showMarkers and entryCondition, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="L", textcolor=color.white)
+plotshape(showMarkers and exitCondition and strategy.position_size > 0, title="Long Exit", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="X", textcolor=color.white)
+
+alertcondition(entryCondition, title="BEST Strategy Long Entry", message="BTCUSDT 5m BEST Strategy long entry")
+alertcondition(exitCondition, title="BEST Strategy Long Exit", message="BTCUSDT 5m BEST Strategy long exit")

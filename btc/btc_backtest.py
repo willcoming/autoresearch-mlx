@@ -11,9 +11,10 @@ btc_backtest.py — 固定不修改
     ...
 """
 
-import importlib
 import sys
 import os
+import runpy
+from types import SimpleNamespace
 
 # 確保可以 import 同目錄的模組
 sys.path.insert(0, os.path.dirname(__file__))
@@ -21,10 +22,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from btc_prepare import load_btc_data, compute_indicators, run_backtest, print_summary
 
 
+def load_strategy():
+    strategy_path = os.path.join(os.path.dirname(__file__), "btc_strategy.py")
+    # 直接執行策略原始碼，避免優化器快速改檔時吃到過期 pyc。
+    return SimpleNamespace(**runpy.run_path(strategy_path))
+
+
 def main():
-    # 動態載入策略（支援 btc_auto.py 修改後重新載入）
-    import btc_strategy as s
-    importlib.reload(s)
+    s = load_strategy()
 
     params = {
         "RSI_LENGTH":    s.RSI_LENGTH,

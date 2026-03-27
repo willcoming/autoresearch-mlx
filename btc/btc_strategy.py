@@ -1,7 +1,25 @@
 """
-btc_strategy.py — 此檔案由自主迴圈修改
-目前最佳策略參數與進出場邏輯。
-對應 Pine Script: S01_strategy.pine（基準線）
+btc_strategy.py — BTC 5m 最終優化交易策略
+
+策略類型：
+  順勢動能 + 超賣回升 + 均線突破的多頭策略。
+
+進場條件（AND）：
+  1. macd_bull
+  2. rsi_exit_oversold
+  3. price_breakout_zlsma
+
+出場條件（AND）：
+  1. macd_bear
+  2. rsi_exit_overbought
+
+這組參數來自 btc_results.tsv 中最後一次創新高的 keep 結果：
+  sharpe=3.0025
+  profit_factor=7.7828
+  win_rate=78.57%
+  max_drawdown=6.84%
+  total_return=38.88%
+  num_trades=14
 
 可用的進場/出場信號（在下方 ENTRY_SIGNALS / EXIT_SIGNALS 中組合）：
   進場候選：
@@ -28,7 +46,7 @@ RSI_OVERBOUGHT = 70
 ZLSMA_LENGTH = 30
 
 # === MACD 參數 ===
-MACD_FAST   = 6
+MACD_FAST   = 12
 MACD_SLOW   = 26
 MACD_SIGNAL = 9
 
