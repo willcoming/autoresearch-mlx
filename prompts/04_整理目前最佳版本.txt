@@ -1,0 +1,12 @@
+Review current train.py and the latest run.log.
+Summarize the current best configuration as:
+- model family
+- lookback
+- optimizer
+- regularization
+- position mapping
+- expected strengths
+- known failure modes
+Then draft one results.tsv line in the format:
+commit	val_sharpe	peak_vram_mb	status	description
+Do not edit files.

@@ -1,0 +1,18 @@
+Read AGENTS.md and current train.py.
+Make exactly one contained experiment intended to improve val_sharpe.
+Rules:
+- edit train.py only
+- do not edit prepare.py, AGENTS.md, program.md, results.tsv, or data files
+- do not install packages
+- do not run multiple experiments
+Before editing, state the hypothesis in 1-2 sentences.
+After editing, run:
+uv run train.py > run.log 2>&1
+Then report:
+- a concise diff summary
+- val_sharpe
+- median_turnover
+- median_drawdown
+- fold_sharpes
+- keep or revert recommendation, with one sentence of rationale
+Stop.

@@ -1,0 +1,2 @@
+If the latest experiment did not improve val_sharpe, revert only train.py to the last committed state, verify the working tree is clean for train.py, and summarize what was reverted.
+If the latest experiment improved val_sharpe, do not revert; just say so and stop.

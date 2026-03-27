@@ -1,0 +1,7 @@
+Do not run the final test yet.
+Review the current best train.py and confirm:
+- prepare.py and data file are unchanged
+- no obvious data leakage
+- results.tsv is up to date
+- the workspace is ready for a single locked test
+Then tell me the exact command I should run next.

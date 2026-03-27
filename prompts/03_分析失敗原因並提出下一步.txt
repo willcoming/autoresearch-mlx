@@ -1,0 +1,9 @@
+Read run.log, the current diff, and the latest summary in this thread.
+Do not edit files yet.
+Analyze why the last experiment likely helped or hurt.
+Suggest the next 3 highest-value single experiments, ordered by expected Sharpe impact and safety.
+For each, include:
+- hypothesis
+- exact part of train.py to change
+- risk level: low / medium / high
+Do not execute anything.

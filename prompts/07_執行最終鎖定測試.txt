@@ -1,0 +1,12 @@
+Read AGENTS.md, program.md, and current train.py.
+Do not modify any files.
+Run:
+REVEAL_FINAL_TEST=1 uv run train.py > final_test.log 2>&1
+Then report only:
+- locked_test_sharpe
+- locked_test_turnover
+- locked_test_drawdown
+- locked_test_cagr
+- locked_test_exposure
+- locked_test_trades
+Stop.

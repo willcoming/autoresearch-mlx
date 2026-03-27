@@ -1,0 +1,17 @@
+Read AGENTS.md, program.md, prepare.py, train.py, and README_zh-TW.md.
+Do not modify any files yet.
+Confirm:
+1. objective and metric,
+2. immutable files,
+3. expected CSV path,
+4. exact baseline command.
+If everything looks correct, run:
+uv sync
+uv run train.py > run.log 2>&1
+Then report only:
+- val_sharpe
+- median_turnover
+- median_drawdown
+- fold_sharpes
+- any setup problems
+Stop after the report.
