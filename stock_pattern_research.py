@@ -56,13 +56,13 @@ TRANSFER_PERSIST = 2             # persistence for single-config WF; ensemble us
 
 # Phase-2 per-stock gate: skip trading if best quick_eval w_score < this
 # Prevents negative-Sharpe contributions from stocks where no config works
-MIN_TRANSFER_SCORE = 0.20        # w_score threshold (Sharpe × trade-count penalty)
+MIN_TRANSFER_SCORE = 0.10        # w_score threshold (Sharpe × trade-count penalty)
 # Phase-2 ensemble: use top-K per-stock configs with majority vote
 TRANSFER_ENSEMBLE_K = 3          # number of configs per stock for voting
 TRANSFER_MAJORITY   = 3          # unanimous: all K configs must agree to fire
 # Phase-2 quick_eval quality floor: configs where win rate is too low are
 # treated as zero (the model is consistently wrong on this stock)
-MIN_WIN_RATE_QUICK_EVAL = 0.42   # min win rate to consider a config usable
+MIN_WIN_RATE_QUICK_EVAL = 0.38   # min win rate to consider a config usable
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1226,16 +1226,16 @@ def _quick_eval_cfg(data: dict, cfg: FeatureConfig, model_name: str,
             # threshold matches what will be applied in the final walk-forward.
             _, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl,
                                       model_name, max(cfg.conf_threshold, TRANSFER_CONF))
-            # Cap score at 0 when win rate is below floor (model is consistently wrong)
+            # Cap score at 0 when win rate is below floor (preserve negative penalty)
+            ws = m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1)
             if m["win_rate"] < MIN_WIN_RATE_QUICK_EVAL and m["n_trades"] >= 3:
-                split_scores.append(0.0)
-            else:
-                split_scores.append(m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1))
+                ws = min(ws, 0.0)  # don't reward low-WR configs, but keep negative
+            split_scores.append(ws)
         except Exception:
             return -999.0
 
-    # Conservative: take the minimum across both splits
-    return min(split_scores)
+    # Average across splits: less conservative than min, fairer to borderline stocks
+    return sum(split_scores) / len(split_scores)
 
 
 def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
@@ -1288,6 +1288,7 @@ def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
             # ── Per-stock config selection ─────────────────────
             best_sym_cfg, best_sym_model = cfg, model_name
             top_sym_cfgs: list[tuple] = []
+            best_s = 1.0  # default: confident (no adjustment) when not adapting
 
             if adapt and cand_pool:
                 scores = [(c, m, _quick_eval_cfg(data, c, m))
@@ -1316,18 +1317,24 @@ def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
                             break
                 # else: top_sym_cfgs stays empty → skip-trade branch below
 
+            # Per-stock confidence: boost threshold for uncertain stocks to
+            # reduce noise (stocks with low quick_eval score need tighter filter)
+            sym_conf = TRANSFER_CONF
+            if 0 < best_s < 0.35:
+                sym_conf = TRANSFER_CONF + 0.05  # 0.70: more selective for uncertain stocks
+
             # ── Walk-forward ─────────────────────────────────
             if len(top_sym_cfgs) >= TRANSFER_ENSEMBLE_K:
                 # Ensemble vote: signal fires only when ≥ majority configs agree
                 wf = walk_forward_ensemble(data, top_sym_cfgs,
-                                           conf_threshold=TRANSFER_CONF,
+                                           conf_threshold=sym_conf,
                                            majority=TRANSFER_MAJORITY,
                                            signal_persist=1)
                 cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}"
             elif len(top_sym_cfgs) >= 1:
                 # Fewer than K valid configs — fall back to single best
                 wf = walk_forward_backtest(data, best_sym_cfg, best_sym_model,
-                                           conf_threshold=TRANSFER_CONF,
+                                           conf_threshold=sym_conf,
                                            signal_persist=TRANSFER_PERSIST)
                 cfg_tag = f"[{best_sym_model}]{best_sym_cfg}"
             else:
