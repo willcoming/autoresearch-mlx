@@ -51,8 +51,8 @@ MIN_TRADES_P1 = 15               # target trade count in the ~440-day val period
 
 # Phase-2 confidence filter: require higher confidence for transfer signals
 # Raises signal quality bar, reduces overtrading on unfamiliar stocks
-TRANSFER_CONF    = 0.58          # raised from 0.55 for tighter signal quality
-TRANSFER_PERSIST = 3             # require signal to persist 3 consecutive bars
+TRANSFER_CONF    = 0.55          # confidence threshold for each config in ensemble
+TRANSFER_PERSIST = 2             # persistence for single-config WF; ensemble uses 1
 
 # ─────────────────────────────────────────────────────────────
 # DATA FETCHING  (Yahoo Finance v8 → synthetic fallback)
@@ -822,8 +822,8 @@ def walk_forward_ensemble(data: dict,
     # If both have majority, neutral (conflict)
     voted[(valley_votes >= majority) & (peak_votes >= majority)] = 0
 
-    # Apply signal persistence filter (require TRANSFER_PERSIST consecutive bars)
-    persist = TRANSFER_PERSIST
+    # Ensemble already filters via majority vote; use minimal persistence (1 bar)
+    persist = 1
     if persist > 1:
         filtered = np.zeros_like(voted)
         for i in range(persist - 1, len(voted)):
