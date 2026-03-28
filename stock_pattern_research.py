@@ -44,6 +44,16 @@ TRAIN_RATIO = 0.70
 INITIAL_TRAIN_DAYS = 252         # 1-year initial training window
 STEP_DAYS          = 63          # re-fit every quarter (~63 trading days)
 
+# Phase-1 scoring: penalise configs with too few trades
+MIN_TRADES_P1 = 15               # target trade count in the ~440-day val period
+# Weighted score = Sharpe × min(1, n_trades / MIN_TRADES_P1)
+# ensures statistical credibility alongside raw Sharpe
+
+# Phase-2 confidence filter: require higher confidence for transfer signals
+# Raises signal quality bar, reduces overtrading on unfamiliar stocks
+TRANSFER_CONF    = 0.58          # raised from 0.55 for tighter signal quality
+TRANSFER_PERSIST = 3             # require signal to persist 3 consecutive bars
+
 # ─────────────────────────────────────────────────────────────
 # DATA FETCHING  (Yahoo Finance v8 → synthetic fallback)
 # ─────────────────────────────────────────────────────────────
@@ -239,18 +249,65 @@ def calc_bollinger_pos(close: np.ndarray, period: int = 20) -> np.ndarray:
     return np.clip(out, -2.0, 2.0)
 
 
+def calc_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+             period: int = 14) -> np.ndarray:
+    """Normalised Average True Range (ATR / close)."""
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low,
+         np.maximum(np.abs(high - prev_close),
+                    np.abs(low  - prev_close)))
+    return _ema(tr, period) / (close + 1e-8)
+
+
+def calc_trend_ratio(close: np.ndarray, ema_period: int = 50) -> np.ndarray:
+    """(close / EMA) − 1 : positive = above trend, negative = below."""
+    return close / (_ema(close, ema_period) + 1e-8) - 1.0
+
+
+def calc_stoch(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+               k_period: int = 14, d_period: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Stochastic Oscillator %K and %D, centred at 0 (range ≈ [-0.5, 0.5]).
+    %K = (close − lowest_low) / (highest_high − lowest_low)
+    %D = 3-bar EMA of %K
+    """
+    n = len(close)
+    k = np.zeros(n)
+    for i in range(k_period - 1, n):
+        lo = low[i - k_period + 1: i + 1].min()
+        hi = high[i - k_period + 1: i + 1].max()
+        k[i] = (close[i] - lo) / (hi - lo + 1e-8)
+    d = _ema(k, d_period)
+    return k - 0.5, d - 0.5          # centred
+
+
+def calc_regime(close: np.ndarray, ema_period: int = 200) -> np.ndarray:
+    """
+    EMA-200 regime: (close / EMA200) − 1.
+    Positive → bull regime (above long-term average).
+    Negative → bear / sideways regime.
+    """
+    return close / (_ema(close, ema_period) + 1e-8) - 1.0
+
+
 # ─────────────────────────────────────────────────────────────
 # FEATURE CONFIGURATION  (the search space)
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class FeatureConfig:
-    windows:     list[int]       # rolling window sizes
-    use_volume:  bool = False
-    use_rsi:     bool = False
-    use_macd:    bool = False
-    use_bb:      bool = False
-    lookback:    int  = 10       # how many past bars to include per sample
+    windows:        list[int]    # rolling window sizes
+    use_volume:     bool  = False
+    use_rsi:        bool  = False
+    use_macd:       bool  = False
+    use_bb:         bool  = False
+    use_atr:        bool  = False   # ATR normalised volatility
+    use_trend:      bool  = False   # close vs EMA-50 ratio
+    use_stoch:      bool  = False   # Stochastic %K/%D
+    use_regime:     bool  = False   # EMA-200 regime filter
+    lookback:       int   = 10      # past bars per sample
+    conf_threshold: float = 0.50    # min predict_proba to act on signal
 
     def __str__(self) -> str:
         tags = [f"w{self.windows}", f"lb{self.lookback}"]
@@ -258,33 +315,69 @@ class FeatureConfig:
         if self.use_rsi:    tags.append("rsi")
         if self.use_macd:   tags.append("macd")
         if self.use_bb:     tags.append("bb")
+        if self.use_atr:    tags.append("atr")
+        if self.use_trend:  tags.append("tr")
+        if self.use_stoch:  tags.append("stoch")
+        if self.use_regime: tags.append("reg")
+        if self.conf_threshold > 0.50:
+            tags.append(f"c{self.conf_threshold:.2f}")
         return "|".join(tags)
 
 
-# All configs the AI will try on TSLA
+# ─── helper to build configs concisely ─────────────────────
+def _cfg(windows, vol=False, rsi=False, macd=False, bb=False,
+         atr=False, trend=False, stoch=False, regime=False, lb=10, conf=0.50):
+    return FeatureConfig(windows, vol, rsi, macd, bb, atr, trend,
+                         stoch, regime, lookback=lb, conf_threshold=conf)
+
+
+# All configs the AI will try on TSLA (× 3 models)
 SEARCH_SPACE: list[FeatureConfig] = [
-    # Baseline: price momentum only
-    FeatureConfig([5],              False, False, False, False, lookback=5),
-    FeatureConfig([5, 10],          False, False, False, False, lookback=10),
-    FeatureConfig([5, 10, 20],      False, False, False, False, lookback=10),
-    # Add volume
-    FeatureConfig([5, 10, 20],      True,  False, False, False, lookback=10),
-    # Add RSI
-    FeatureConfig([5, 10, 20],      False, True,  False, False, lookback=14),
-    # Add MACD
-    FeatureConfig([5, 10, 20],      False, False, True,  False, lookback=20),
-    # Add Bollinger
-    FeatureConfig([5, 10, 20],      False, False, False, True,  lookback=20),
-    # Combine momentum + volume + RSI
-    FeatureConfig([5, 10, 20],      True,  True,  False, False, lookback=14),
-    # Full combo
-    FeatureConfig([5, 10, 20],      True,  True,  True,  True,  lookback=20),
-    # Wider windows
-    FeatureConfig([10, 20, 50],     True,  True,  True,  True,  lookback=30),
-    # Very wide + long lookback
-    FeatureConfig([5, 10, 20, 50],  True,  True,  True,  True,  lookback=30),
-    # RSI + BB only (oscillator-focused)
-    FeatureConfig([20],             False, True,  False, True,  lookback=14),
+    # ── Tier 1: baseline momentum ───────────────────────────
+    _cfg([5],              lb=5),
+    _cfg([5, 10],          lb=10),
+    _cfg([5, 10, 20],      lb=10),
+    # ── Tier 2: add individual indicators ───────────────────
+    _cfg([5, 10, 20], vol=True,             lb=10),
+    _cfg([5, 10, 20], rsi=True,             lb=14),
+    _cfg([5, 10, 20], macd=True,            lb=20),
+    _cfg([5, 10, 20], bb=True,              lb=20),
+    _cfg([5, 10, 20], atr=True,             lb=14),
+    _cfg([5, 10, 20], trend=True,           lb=14),
+    _cfg([5, 10, 20], stoch=True,           lb=14),   # NEW: Stochastic
+    _cfg([5, 10, 20], regime=True,          lb=20),   # NEW: EMA-200 regime
+    # ── Tier 3: combos that showed promise ──────────────────
+    _cfg([5, 10, 20], vol=True, rsi=True,   lb=14),
+    _cfg([5, 10, 20], macd=True, bb=True,   lb=20),
+    _cfg([5, 10, 20], rsi=True, atr=True,   lb=14),
+    _cfg([5, 10, 20], macd=True, trend=True,lb=20),
+    _cfg([5, 10, 20], atr=True, trend=True, lb=20),
+    _cfg([5, 10, 20], stoch=True, rsi=True, lb=14),   # NEW: Stoch+RSI
+    _cfg([5, 10, 20], stoch=True, macd=True,lb=20),   # NEW: Stoch+MACD
+    _cfg([5, 10, 20], macd=True, regime=True,lb=20),  # NEW: MACD+regime
+    _cfg([5, 10, 20], rsi=True, regime=True,lb=14),   # NEW: RSI+regime
+    # ── Tier 4: full combos ──────────────────────────────────
+    _cfg([5, 10, 20], True, True, True, True,  lb=20),
+    _cfg([5, 10, 20], True, True, True, False, atr=True, trend=True, lb=20),
+    _cfg([10, 20, 50],True, True, True, True,  lb=30),
+    _cfg([5, 10, 20], rsi=True, macd=True, atr=True, trend=True, lb=20),  # NEW
+    _cfg([5, 10, 20], macd=True, trend=True, regime=True, lb=20),          # NEW
+    _cfg([5, 10, 20], stoch=True, macd=True, trend=True, lb=20),           # NEW
+    _cfg([5, 10, 20], rsi=True, atr=True, regime=True, lb=14),             # NEW
+    # ── Tier 5: confidence filtering (proven combos + conf=0.55/0.60/0.65) ─
+    _cfg([5, 10, 20], macd=True,            lb=20, conf=0.55),
+    _cfg([5, 10, 20], macd=True,            lb=20, conf=0.60),
+    _cfg([5, 10, 20], macd=True,            lb=20, conf=0.65),   # NEW
+    _cfg([5, 10, 20], rsi=True, atr=True,   lb=14, conf=0.55),
+    _cfg([5, 10, 20], rsi=True, atr=True,   lb=14, conf=0.60),
+    _cfg([5, 10, 20], True, True, True, False, atr=True, trend=True,
+         lb=20, conf=0.55),
+    _cfg([5, 10, 20], True, True, True, False, atr=True, trend=True,
+         lb=20, conf=0.60),
+    _cfg([5, 10, 20], macd=True, trend=True,lb=20, conf=0.55),  # NEW
+    _cfg([5, 10, 20], macd=True, trend=True,lb=20, conf=0.60),  # NEW
+    _cfg([5, 10, 20], stoch=True, macd=True,lb=20, conf=0.55),  # NEW
+    _cfg([5, 10, 20], rsi=True, atr=True, regime=True, lb=14, conf=0.55),  # NEW
 ]
 
 
@@ -354,6 +447,26 @@ def build_features(data: dict, cfg: FeatureConfig) -> tuple[np.ndarray, np.ndarr
     if cfg.use_bb:
         cols.append(calc_bollinger_pos(close))
 
+    if cfg.use_atr:
+        cols.append(calc_atr(high, low, close) - calc_atr(high, low, close).mean())
+
+    if cfg.use_trend:
+        cols.append(calc_trend_ratio(close))
+        # Trend momentum: rate-of-change of the EMA ratio
+        tr = calc_trend_ratio(close)
+        tr_roc = np.zeros(n)
+        tr_roc[10:] = tr[10:] - tr[:-10]
+        cols.append(tr_roc)
+
+    if cfg.use_stoch:
+        sk, sd = calc_stoch(high, low, close)
+        cols.append(sk)
+        cols.append(sd)
+        cols.append(sk - sd)      # %K−%D crossover signal
+
+    if cfg.use_regime:
+        cols.append(calc_regime(close))   # EMA-200 regime
+
     feats = np.stack(cols, axis=1)                  # (n, F)
 
     # ── build lookback windows ───────────────────────────────
@@ -403,12 +516,18 @@ def _oversample_minorities(X: np.ndarray, y: np.ndarray,
 
 def backtest_strategy(close: np.ndarray, preds: np.ndarray,
                       stop_loss_pct: float = 0.05,
-                      commission: float = 0.001) -> dict:
+                      commission: float = 0.001,
+                      proba: np.ndarray | None = None,
+                      atr: np.ndarray | None = None,
+                      atr_stop_mult: float = 2.5) -> dict:
     """
     Long-only strategy driven by model predictions:
       • Enter  LONG  when prediction == -1  (valley / buy signal)
       • Exit   LONG  when prediction ==  1  (peak   / sell signal)
-      • Hard stop-loss at stop_loss_pct below entry price
+      • Stop-loss: ATR-based (entry − atr_stop_mult × ATR) when atr is given,
+        otherwise fixed stop_loss_pct below entry price
+      • Confidence-proportional sizing: when proba is provided, the fraction
+        invested scales linearly from 0.5× (p=0.50) to 1.0× (p≥0.75)
       • commission applied on each buy and sell
 
     Returns a dict with Sharpe, total_return, max_drawdown,
@@ -419,6 +538,7 @@ def backtest_strategy(close: np.ndarray, preds: np.ndarray,
     cash    = 10_000.0
     shares  = 0.0
     entry_p = 0.0
+    stop_p  = 0.0
     trades: list[tuple[float, float]] = []   # (entry_price, exit_price)
 
     equity[0] = cash
@@ -427,22 +547,36 @@ def backtest_strategy(close: np.ndarray, preds: np.ndarray,
         price = close[i]
 
         # ── stop-loss check ─────────────────────────────────
-        if shares > 0 and price <= entry_p * (1.0 - stop_loss_pct):
+        if shares > 0 and price <= stop_p:
             cash    = shares * price * (1.0 - commission)
             trades.append((entry_p, price))
             shares  = 0.0
             entry_p = 0.0
+            stop_p  = 0.0
 
         # ── signal-driven entry / exit ───────────────────────
         if shares == 0 and preds[i] == -1:              # valley → buy
-            shares  = cash * (1.0 - commission) / price
-            cash    = 0.0
+            # Confidence-proportional sizing [0.5, 1.0]
+            if proba is not None:
+                p = float(proba[i])
+                size_frac = 0.5 + 0.5 * min(1.0, max(0.0, (p - 0.50) / 0.25))
+            else:
+                size_frac = 1.0
+            invest = cash * size_frac
+            shares  = invest * (1.0 - commission) / price
+            cash   -= invest
             entry_p = price
+            # ATR-based or fixed stop
+            if atr is not None and atr[i] > 0:
+                stop_p = price - atr_stop_mult * atr[i] * price
+            else:
+                stop_p = price * (1.0 - stop_loss_pct)
         elif shares > 0 and preds[i] == 1:              # peak → sell
-            cash    = shares * price * (1.0 - commission)
+            cash    = cash + shares * price * (1.0 - commission)
             trades.append((entry_p, price))
             shares  = 0.0
             entry_p = 0.0
+            stop_p  = 0.0
 
         equity[i] = cash + shares * price
 
@@ -479,6 +613,46 @@ def backtest_strategy(close: np.ndarray, preds: np.ndarray,
     }
 
 
+def _apply_conf_filter(clf, X_scaled: np.ndarray,
+                       conf_threshold: float,
+                       return_proba: bool = False
+                       ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """
+    Return predictions filtered by class-specific probability.
+    A valley prediction (-1) is kept only when P(valley) ≥ threshold.
+    A peak  prediction ( 1) is kept only when P(peak)   ≥ threshold.
+    Everything else becomes 0 (neutral / stay flat).
+
+    When return_proba=True, also returns the max-class probability array
+    aligned with the predictions (for confidence-proportional sizing).
+    """
+    classes = list(clf.classes_)
+    proba_mat = clf.predict_proba(X_scaled)        # (n, n_classes)
+
+    peak_col   = classes.index(1)  if  1 in classes else -1
+    valley_col = classes.index(-1) if -1 in classes else -1
+
+    out = np.zeros(len(X_scaled), dtype=np.int32)
+
+    if conf_threshold <= 0.50:
+        out = clf.predict(X_scaled).astype(np.int32)
+    else:
+        if peak_col   >= 0:
+            out[proba_mat[:, peak_col]   >= conf_threshold] =  1
+        if valley_col >= 0:
+            out[proba_mat[:, valley_col] >= conf_threshold] = -1
+
+    if return_proba:
+        # Max probability across signal classes (used for sizing)
+        max_proba = np.zeros(len(X_scaled), dtype=np.float32)
+        if valley_col >= 0:
+            buy_mask = out == -1
+            max_proba[buy_mask] = proba_mat[buy_mask, valley_col]
+        return out, max_proba
+
+    return out
+
+
 def _make_clf(model_name: str):
     if model_name == "rf":
         return RandomForestClassifier(n_estimators=300, max_depth=10,
@@ -495,7 +669,12 @@ def _make_clf(model_name: str):
 
 def walk_forward_backtest(data: dict, cfg: FeatureConfig, model_name: str,
                            initial_train: int = INITIAL_TRAIN_DAYS,
-                           step: int = STEP_DAYS) -> dict:
+                           step: int = STEP_DAYS,
+                           conf_threshold: float | None = None,
+                           signal_persist: int = 1) -> dict:
+    # conf_threshold from cfg unless overridden
+    if conf_threshold is None:
+        conf_threshold = cfg.conf_threshold
     """
     Walk-forward backtest covering the FULL data period:
 
@@ -518,6 +697,7 @@ def walk_forward_backtest(data: dict, cfg: FeatureConfig, model_name: str,
                 "n_oos_days": 0, "n_windows": 0}
 
     preds   = np.zeros(n, dtype=np.int32)   # 0 = stay flat during warm-up
+    probas  = np.zeros(n, dtype=np.float32) # confidence for sizing
     n_wins  = 0
     cursor  = initial_train
 
@@ -533,25 +713,156 @@ def walk_forward_backtest(data: dict, cfg: FeatureConfig, model_name: str,
 
         clf = _make_clf(model_name)
         clf.fit(X_aug, y_aug)
-        preds[cursor:te_end] = clf.predict(X_te_s)
+        p_slice, prob_slice = _apply_conf_filter(clf, X_te_s, conf_threshold,
+                                                  return_proba=True)
+        preds[cursor:te_end]  = p_slice
+        probas[cursor:te_end] = prob_slice
 
         n_wins += 1
         cursor += step
 
-    oos_close = close[initial_train:]
-    oos_preds = preds[initial_train:]
+    oos_close  = close[initial_train:]
+    oos_preds  = preds[initial_train:]
+    oos_probas = probas[initial_train:]
 
-    bt = backtest_strategy(oos_close, oos_preds)
+    # Optional: require signal to persist signal_persist consecutive bars
+    if signal_persist > 1:
+        filtered = np.zeros_like(oos_preds)
+        filt_pb  = np.zeros_like(oos_probas)
+        for i in range(signal_persist - 1, len(oos_preds)):
+            window = oos_preds[i - signal_persist + 1: i + 1]
+            if np.all(window == window[0]) and window[0] != 0:
+                filtered[i] = window[0]
+                filt_pb[i]  = oos_probas[i]
+        oos_preds  = filtered
+        oos_probas = filt_pb
+
+    # ATR for dynamic stop-loss (raw close-aligned ATR)
+    raw_close  = np.array(data["close"])
+    raw_high   = np.array(data["high"])
+    raw_low    = np.array(data["low"])
+    atr_full   = calc_atr(raw_high, raw_low, raw_close)
+    # Align with build_features start offset (max(lb, 51))
+    feat_start = max(cfg.lookback, 51)
+    atr_aligned = atr_full[feat_start:]
+    oos_atr     = atr_aligned[initial_train:] if len(atr_aligned) > initial_train else None
+
+    bt = backtest_strategy(oos_close, oos_preds,
+                           proba=oos_probas, atr=oos_atr)
     bt["bnh_return"]  = float((close[-1] - close[initial_train]) / (close[initial_train] + 1e-8))
     bt["n_oos_days"]  = int(len(oos_close))
     bt["n_windows"]   = int(n_wins)
     return bt
 
 
+def _get_oos_preds(data: dict, cfg: FeatureConfig, model_name: str,
+                   initial_train: int, step: int,
+                   conf_threshold: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run one walk-forward pass and return (oos_close, oos_preds).
+    Used by the ensemble to collect per-config predictions.
+    """
+    X, y, close = build_features(data, cfg)
+    n = len(X)
+    if initial_train >= n:
+        return close[initial_train:], np.zeros(n - initial_train, dtype=np.int32)
+
+    preds  = np.zeros(n, dtype=np.int32)
+    cursor = initial_train
+    while cursor < n:
+        te_end = min(cursor + step, n)
+        scaler   = StandardScaler()
+        X_tr_s   = scaler.fit_transform(X[:cursor])
+        X_te_s   = scaler.transform(X[cursor:te_end])
+        np.random.seed(42)
+        X_aug, y_aug = _oversample_minorities(X_tr_s, y[:cursor])
+        clf = _make_clf(model_name)
+        clf.fit(X_aug, y_aug)
+        preds[cursor:te_end] = _apply_conf_filter(clf, X_te_s, conf_threshold)
+        cursor += step
+
+    return close[initial_train:], preds[initial_train:]
+
+
+def walk_forward_ensemble(data: dict,
+                          top_cfgs: list[tuple],
+                          initial_train: int = INITIAL_TRAIN_DAYS,
+                          step: int = STEP_DAYS,
+                          conf_threshold: float = TRANSFER_CONF,
+                          majority: int = 2) -> dict:
+    """
+    Ensemble walk-forward: collect OOS predictions from the top-K configs
+    and vote.  A signal fires only when ≥ majority configs agree.
+
+    top_cfgs: list of (FeatureConfig, model_name) tuples
+    majority : minimum agreements needed to fire a signal (default 2 of K)
+    """
+    K = len(top_cfgs)
+    all_preds: list[np.ndarray] = []
+    oos_close: np.ndarray | None = None
+
+    for cfg, mname in top_cfgs:
+        oc, op = _get_oos_preds(data, cfg, mname, initial_train, step, conf_threshold)
+        all_preds.append(op)
+        if oos_close is None:
+            oos_close = oc
+
+    # All configs share the same time-alignment (start = max(lb, 51) = 51 for lb≤51)
+    min_len = min(len(p) for p in all_preds)
+    arr  = np.array([p[:min_len] for p in all_preds])   # (K, T)
+    oos_close = oos_close[:min_len]
+
+    valley_votes = (arr == -1).sum(axis=0)
+    peak_votes   = (arr ==  1).sum(axis=0)
+
+    voted = np.zeros(min_len, dtype=np.int32)
+    # Peaks take priority only when no valley consensus
+    voted[valley_votes >= majority] = -1
+    voted[peak_votes   >= majority] =  1
+    # If both have majority, neutral (conflict)
+    voted[(valley_votes >= majority) & (peak_votes >= majority)] = 0
+
+    # Apply signal persistence filter (require TRANSFER_PERSIST consecutive bars)
+    persist = TRANSFER_PERSIST
+    if persist > 1:
+        filtered = np.zeros_like(voted)
+        for i in range(persist - 1, len(voted)):
+            window = voted[i - persist + 1: i + 1]
+            if np.all(window == window[0]) and window[0] != 0:
+                filtered[i] = window[0]
+        voted = filtered
+
+    # ATR-based stop-loss for ensemble
+    raw_c = np.array(data["close"])
+    raw_h = np.array(data["high"])
+    raw_l = np.array(data["low"])
+    atr_f = calc_atr(raw_h, raw_l, raw_c)
+    # Use first config's lookback for alignment
+    feat_start = max(top_cfgs[0][0].lookback, 51)
+    atr_al = atr_f[feat_start:]
+    oos_atr = atr_al[initial_train:min_len + initial_train] if len(atr_al) > initial_train else None
+    if oos_atr is not None and len(oos_atr) != min_len:
+        oos_atr = None  # length mismatch: skip ATR stop
+
+    # Vote strength as proxy for confidence (fraction of configs agreeing)
+    vote_strength = np.zeros(min_len, dtype=np.float32)
+    vote_strength[voted == -1] = (valley_votes[voted == -1] / K).astype(np.float32)
+    # Map vote fraction [majority/K .. 1] → confidence proxy [0.50 .. 0.75]
+    vote_proba = 0.50 + 0.25 * (vote_strength - majority / K) / max(1.0 - majority / K, 1e-8)
+
+    bt = backtest_strategy(oos_close, voted, proba=vote_proba, atr=oos_atr)
+    bnh_start   = oos_close[0] if len(oos_close) > 0 else 1.0
+    bt["bnh_return"] = float((oos_close[-1] - bnh_start) / (bnh_start + 1e-8))
+    bt["n_oos_days"] = int(min_len)
+    bt["n_windows"]  = int(len(oos_close) // step)
+    return bt
+
+
 def train_and_evaluate(X_tr: np.ndarray, y_tr: np.ndarray,
                        X_val: np.ndarray, y_val: np.ndarray,
                        close_val: np.ndarray,
-                       model_name: str = "rf") -> tuple[object, dict]:
+                       model_name: str = "rf",
+                       conf_threshold: float = 0.50) -> tuple[object, dict]:
     """
     Train a classifier and return (model, metrics_dict).
 
@@ -585,7 +896,7 @@ def train_and_evaluate(X_tr: np.ndarray, y_tr: np.ndarray,
         )
 
     clf.fit(X_tr_s, y_tr)
-    preds = clf.predict(X_val_s)
+    preds = _apply_conf_filter(clf, X_val_s, conf_threshold)
 
     # ── classification metrics ───────────────────────────────
     def _f1(cls: int) -> float:
@@ -642,7 +953,7 @@ def phase1_explore(data: dict) -> tuple[FeatureConfig, str, list[dict]]:
     MODEL_NAMES = ["rf", "gb", "lr"]
 
     hdr = (f"  {'#':>3}  {'Feature Config':<42}  {'Mdl':>3}"
-           f"  {'Sharpe':>6}  {'Ret%':>6}  {'DD%':>6}  {'WR%':>5}  {'#T':>3}  {'F1':>5}")
+           f"  {'Sharpe':>6}  {'Ret%':>6}  {'DD%':>6}  {'WR%':>5}  {'#T':>3}  {'Wscore':>7}  {'F1':>5}")
     print(hdr)
     print("  " + "─" * 82)
 
@@ -666,21 +977,25 @@ def phase1_explore(data: dict) -> tuple[FeatureConfig, str, list[dict]]:
             exp_num += 1
             try:
                 np.random.seed(42)
-                clf, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl, mname)
+                clf, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl,
+                                            mname, cfg.conf_threshold)
 
                 sh  = m["sharpe"];       ret = m["total_return"] * 100
                 dd  = m["max_drawdown"] * 100; wr = m["win_rate"] * 100
                 nt  = m["n_trades"];     f1  = m["f1"]
 
-                marker = " ←best" if m["sharpe"] > best_sharpe else ""
+                # Weighted score: penalise low-trade-count configs
+                w_score = m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1)
+                marker  = " ←best" if w_score > best_sharpe else ""
                 print(f"  {exp_num:>3}  {str(cfg):<42}  {mname:>3}"
                       f"  {sh:>6.2f}  {ret:>5.1f}%  {dd:>5.1f}%"
                       f"  {wr:>4.0f}%  {nt:>3}  {f1:.3f}{marker}")
 
-                results.append({"cfg": cfg, "model": mname, **m})
+                results.append({"cfg": cfg, "model": mname,
+                                 "w_score": w_score, **m})
 
-                if m["sharpe"] > best_sharpe:
-                    best_sharpe     = m["sharpe"]
+                if w_score > best_sharpe:
+                    best_sharpe     = w_score
                     best_cfg        = cfg
                     best_model_name = mname
 
@@ -693,7 +1008,25 @@ def phase1_explore(data: dict) -> tuple[FeatureConfig, str, list[dict]]:
     print(f"\n  ✓ Best config : {best_cfg}")
     print(f"  ✓ Best model  : {best_model_name}")
     print(f"  ✓ Best Sharpe : {best_sharpe:.3f}")
-    return best_cfg, best_model_name, results
+
+    # Build top-K ensemble list (unique configs by w_score, excluding 0-trade results)
+    top_k = 3
+    seen  = set()
+    top_cfgs_models: list[tuple] = []
+    for r in sorted(results, key=lambda x: -x.get("w_score", -999)):
+        if r.get("n_trades", 0) < 5:
+            continue
+        key = (str(r["cfg"]), r["model"])
+        if key not in seen:
+            seen.add(key)
+            top_cfgs_models.append((r["cfg"], r["model"]))
+        if len(top_cfgs_models) >= top_k:
+            break
+    print(f"  ✓ Ensemble    : {top_k} configs for Phase-2 voting")
+    for i, (c, m) in enumerate(top_cfgs_models, 1):
+        print(f"      {i}. {c}  [{m}]")
+
+    return best_cfg, best_model_name, results, top_cfgs_models
 
 
 # ─────────────────────────────────────────────────────────────
@@ -724,7 +1057,8 @@ def phase2_transfer(cfg: FeatureConfig, model_name: str, symbols: list[str]) -> 
             X_vl, y_vl, close_vl = build_features(vl_data, cfg)
 
             np.random.seed(42)
-            clf, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl, model_name)
+            clf, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl,
+                                        model_name, cfg.conf_threshold)
 
             print(f"  {sym:<7}  {m['sharpe']:>6.2f}"
                   f"  {m['total_return']*100:>6.1f}%"
@@ -765,9 +1099,13 @@ def print_feature_importance(clf, cfg: FeatureConfig, top_n: int = 10) -> None:
         names.append("log_volume")
         for w in cfg.windows[:2]:
             names.append(f"vol_ratio_{w}d")
-    if cfg.use_rsi:  names.append("rsi")
-    if cfg.use_macd: names += ["macd_line", "macd_hist"]
-    if cfg.use_bb:   names.append("bb_pos")
+    if cfg.use_rsi:   names.append("rsi")
+    if cfg.use_macd:  names += ["macd_line", "macd_hist"]
+    if cfg.use_bb:    names.append("bb_pos")
+    if cfg.use_atr:    names.append("atr")
+    if cfg.use_trend:  names += ["trend_ratio", "trend_roc"]
+    if cfg.use_stoch:  names += ["stoch_k", "stoch_d", "stoch_kd"]
+    if cfg.use_regime: names.append("regime_ema200")
 
     F = len(names)                                  # features per time-step
     lb = cfg.lookback
@@ -793,13 +1131,23 @@ def print_feature_importance(clf, cfg: FeatureConfig, top_n: int = 10) -> None:
 # RESULTS LOGGING
 # ─────────────────────────────────────────────────────────────
 
-def phase2_transfer_wf(cfg: FeatureConfig, model_name: str, symbols: list[str]) -> list[dict]:
-    """Walk-forward backtest on each test stock — full 4-year coverage."""
+def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
+                       symbols: list[str],
+                       top_cfgs_models: list[tuple] | None = None) -> list[dict]:
+    """
+    Walk-forward backtest on each test stock — full 4-year coverage.
+    If top_cfgs_models is supplied, uses an ensemble majority vote
+    across those configs instead of a single config.
+    """
     oos_yr = (DATA_PERIOD_DAYS - INITIAL_TRAIN_DAYS) / 252
+    use_ensemble = top_cfgs_models is not None and len(top_cfgs_models) > 1
     print(f"\n{'═'*68}")
-    print(f"  PHASE 2 — Walk-Forward Transfer  "
-          f"({oos_yr:.1f}yr OOS per stock)")
-    print(f"  Config: {cfg}  |  Model: {model_name}")
+    if use_ensemble:
+        print(f"  PHASE 2 — Walk-Forward Transfer  Ensemble ({len(top_cfgs_models)}-config vote)")
+    else:
+        print(f"  PHASE 2 — Walk-Forward Transfer  ({oos_yr:.1f}yr OOS per stock)")
+    print(f"  Best config: {cfg}  |  Model: {model_name}")
+    print(f"  TRANSFER_CONF={TRANSFER_CONF}")
     print(f"{'═'*68}\n")
 
     hdr = (f"  {'Symbol':<7}  {'Sharpe':>6}  {'Ret%':>7}  {'DD%':>6}"
@@ -811,7 +1159,12 @@ def phase2_transfer_wf(cfg: FeatureConfig, model_name: str, symbols: list[str]) 
     for sym in symbols:
         try:
             data = fetch_stock_data(sym)
-            wf   = walk_forward_backtest(data, cfg, model_name)
+            if use_ensemble:
+                wf = walk_forward_ensemble(data, top_cfgs_models)
+            else:
+                wf = walk_forward_backtest(data, cfg, model_name,
+                                           conf_threshold=TRANSFER_CONF,
+                                           signal_persist=TRANSFER_PERSIST)
             print(f"  {sym:<7}  {wf['sharpe']:>6.2f}"
                   f"  {wf['total_return']*100:>6.1f}%"
                   f"  {wf['max_drawdown']*100:>5.1f}%"
@@ -882,7 +1235,7 @@ def main() -> None:
     tsla = fetch_stock_data(TRAIN_SYMBOL)
 
     # ── Phase 1 : autonomous exploration (70/30 quick selection) ──
-    best_cfg, best_model_name, explore_results = phase1_explore(tsla)
+    best_cfg, best_model_name, explore_results, top_cfgs_models = phase1_explore(tsla)
 
     # Feature importance (train on 70% split)
     close  = np.array(tsla["close"])
@@ -916,7 +1269,9 @@ def main() -> None:
     print(f"  OOS days     : {tsla_wf['n_oos_days']}")
 
     # ── Phase 2 : walk-forward transfer to other stocks ───────
-    transfer_results = phase2_transfer_wf(best_cfg, best_model_name, TEST_SYMBOLS)
+    # Use ensemble (majority vote of top-3 configs) for more robust signals
+    transfer_results = phase2_transfer_wf(best_cfg, best_model_name, TEST_SYMBOLS,
+                                          top_cfgs_models=top_cfgs_models)
 
     # ── Save ──────────────────────────────────────────────────
     save_results(explore_results, transfer_results, best_cfg)
