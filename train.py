@@ -68,7 +68,8 @@ class PolicyMLP(nn.Module):
         self.out = nn.Linear(in_dim, 1)
 
     def __call__(self, x: mx.array) -> mx.array:
-        h = x.reshape((x.shape[0], -1))
+        recency = mx.array(np.linspace(0.95, 1.05, x.shape[1], dtype=np.float32)).reshape((1, x.shape[1], 1))
+        h = (x * recency).reshape((x.shape[0], -1))
         for layer in self.hidden_layers:
             h = nn.gelu(layer(h))
         logits = self.out(h)
@@ -78,7 +79,7 @@ class PolicyMLP(nn.Module):
 def positions_from_logits(logits: mx.array) -> mx.array:
     if ALLOW_SHORT:
         return mx.tanh(logits)
-    return mx.sigmoid(logits)
+    return mx.sigmoid(logits - 2.5)
 
 
 def _cost_rate() -> float:
