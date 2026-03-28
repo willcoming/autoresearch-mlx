@@ -54,6 +54,16 @@ MIN_TRADES_P1 = 15               # target trade count in the ~440-day val period
 TRANSFER_CONF    = 0.65          # confidence threshold for Phase-2 transfer signals
 TRANSFER_PERSIST = 2             # persistence for single-config WF; ensemble uses 1
 
+# Phase-2 per-stock gate: skip trading if best quick_eval w_score < this
+# Prevents negative-Sharpe contributions from stocks where no config works
+MIN_TRANSFER_SCORE = 0.10        # w_score threshold (Sharpe × trade-count penalty)
+# Phase-2 ensemble: use top-K per-stock configs with majority vote
+TRANSFER_ENSEMBLE_K = 3          # number of configs per stock for voting
+TRANSFER_MAJORITY   = 2          # minimum agreements to fire signal (of K)
+# Phase-2 quick_eval quality floor: configs where win rate is too low are
+# treated as zero (the model is consistently wrong on this stock)
+MIN_WIN_RATE_QUICK_EVAL = 0.38   # min win rate to consider a config usable
+
 
 # ─────────────────────────────────────────────────────────────
 # DATA FETCHING  (Yahoo Finance v8 → synthetic fallback)
@@ -1205,6 +1215,9 @@ def _quick_eval_cfg(data: dict, cfg: FeatureConfig, model_name: str,
         # threshold matches what will be applied in the final walk-forward.
         _, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl,
                                   model_name, max(cfg.conf_threshold, TRANSFER_CONF))
+        # Cap score at 0 when win rate is below floor (model is consistently wrong)
+        if m["win_rate"] < MIN_WIN_RATE_QUICK_EVAL and m["n_trades"] >= 3:
+            return 0.0
         return m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1)
     except Exception:
         return -999.0
@@ -1259,25 +1272,67 @@ def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
 
             # ── Per-stock config selection ─────────────────────
             best_sym_cfg, best_sym_model = cfg, model_name
+            top_sym_cfgs: list[tuple] = []
+
             if adapt and cand_pool:
                 scores = [(c, m, _quick_eval_cfg(data, c, m))
                           for c, m in cand_pool]
                 scores.sort(key=lambda x: -x[2])
-                if scores[0][2] > -999:
-                    best_sym_cfg, best_sym_model, _ = scores[0]
+                best_c, best_m, best_s = scores[0]
 
-            wf = walk_forward_backtest(data, best_sym_cfg, best_sym_model,
-                                       conf_threshold=TRANSFER_CONF,
-                                       signal_persist=TRANSFER_PERSIST)
+                # Gate: only trade this stock if at least one config is profitable
+                if best_s >= MIN_TRANSFER_SCORE:
+                    best_sym_cfg, best_sym_model = best_c, best_m
+                    # Build top-K with diversity across feature families so
+                    # ensemble configs are less correlated in their errors
+                    seen_fam: set[str] = set()
+                    for c, m, s in scores:
+                        if s <= -999:
+                            continue
+                        fam = ("macd" if c.use_macd else
+                               "stoch" if c.use_stoch else
+                               "rsi" if c.use_rsi else
+                               "bb" if c.use_bb else
+                               "atr" if c.use_atr else "base")
+                        if fam not in seen_fam:
+                            seen_fam.add(fam)
+                            top_sym_cfgs.append((c, m))
+                        if len(top_sym_cfgs) >= TRANSFER_ENSEMBLE_K:
+                            break
+                # else: top_sym_cfgs stays empty → skip-trade branch below
+
+            # ── Walk-forward ─────────────────────────────────
+            if len(top_sym_cfgs) >= TRANSFER_ENSEMBLE_K:
+                # Ensemble vote: signal fires only when ≥ majority configs agree
+                wf = walk_forward_ensemble(data, top_sym_cfgs,
+                                           conf_threshold=TRANSFER_CONF,
+                                           majority=TRANSFER_MAJORITY)
+                cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}"
+            elif len(top_sym_cfgs) >= 1:
+                # Fewer than K valid configs — fall back to single best
+                wf = walk_forward_backtest(data, best_sym_cfg, best_sym_model,
+                                           conf_threshold=TRANSFER_CONF,
+                                           signal_persist=TRANSFER_PERSIST)
+                cfg_tag = f"[{best_sym_model}]{best_sym_cfg}"
+            else:
+                # No profitable config found — skip trading (hold cash)
+                raw_close = np.array(data["close"])
+                bnh = float((raw_close[-1] - raw_close[INITIAL_TRAIN_DAYS])
+                            / (raw_close[INITIAL_TRAIN_DAYS] + 1e-8))
+                wf = {"sharpe": 0.0, "total_return": 0.0, "max_drawdown": 0.0,
+                      "win_rate": 0.0, "n_trades": 0, "bnh_return": bnh,
+                      "n_oos_days": 0, "n_windows": 0}
+                cfg_tag = "SKIP"
+
             print(f"  {sym:<7}  {wf['sharpe']:>6.2f}"
                   f"  {wf['total_return']*100:>6.1f}%"
                   f"  {wf['max_drawdown']*100:>5.1f}%"
                   f"  {wf['win_rate']*100:>4.0f}%"
                   f"  {wf['n_trades']:>3}"
                   f"  {wf['bnh_return']*100:>6.1f}%"
-                  f"  {wf['n_windows']:>5}  [{best_sym_model}]{best_sym_cfg}")
+                  f"  {wf['n_windows']:>5}  {cfg_tag}")
             results.append({"symbol": sym, "n": len(data["close"]),
-                             "cfg": str(best_sym_cfg), **wf})
+                             "cfg": cfg_tag, **wf})
         except Exception as e:
             print(f"  {sym:<7}  ERROR: {e}")
             results.append({"symbol": sym, "error": str(e)})
