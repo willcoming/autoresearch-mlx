@@ -56,7 +56,7 @@ TRANSFER_PERSIST = 2             # persistence for single-config WF; ensemble us
 
 # Phase-2 per-stock gate: skip trading if best quick_eval w_score < this
 # Prevents negative-Sharpe contributions from stocks where no config works
-MIN_TRANSFER_SCORE = 0.20        # w_score threshold (Sharpe × trade-count penalty)
+MIN_TRANSFER_SCORE = 0.30        # w_score threshold (Sharpe × trade-count penalty)
 # Phase-2 ensemble: use top-K per-stock configs with majority vote
 TRANSFER_ENSEMBLE_K = 3          # number of configs per stock for voting
 TRANSFER_MAJORITY   = 3          # unanimous: all K configs must agree to fire
@@ -835,13 +835,15 @@ def walk_forward_ensemble(data: dict,
                           initial_train: int = INITIAL_TRAIN_DAYS,
                           step: int = STEP_DAYS,
                           conf_threshold: float = TRANSFER_CONF,
-                          majority: int = 2) -> dict:
+                          majority: int = 2,
+                          signal_persist: int = 1) -> dict:
     """
     Ensemble walk-forward: collect OOS predictions from the top-K configs
     and vote.  A signal fires only when ≥ majority configs agree.
 
-    top_cfgs: list of (FeatureConfig, model_name) tuples
-    majority : minimum agreements needed to fire a signal (default 2 of K)
+    top_cfgs      : list of (FeatureConfig, model_name) tuples
+    majority      : minimum agreements needed to fire a signal (default 2 of K)
+    signal_persist: require the voted signal to persist this many bars
     """
     K = len(top_cfgs)
     all_preds: list[np.ndarray] = []
@@ -868,8 +870,8 @@ def walk_forward_ensemble(data: dict,
     # If both have majority, neutral (conflict)
     voted[(valley_votes >= majority) & (peak_votes >= majority)] = 0
 
-    # Ensemble already filters via majority vote; use minimal persistence (1 bar)
-    persist = 1
+    # Optional: require the voted signal to hold for signal_persist consecutive bars
+    persist = signal_persist
     if persist > 1:
         filtered = np.zeros_like(voted)
         for i in range(persist - 1, len(voted)):
@@ -1306,7 +1308,8 @@ def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
                 # Ensemble vote: signal fires only when ≥ majority configs agree
                 wf = walk_forward_ensemble(data, top_sym_cfgs,
                                            conf_threshold=TRANSFER_CONF,
-                                           majority=TRANSFER_MAJORITY)
+                                           majority=TRANSFER_MAJORITY,
+                                           signal_persist=TRANSFER_PERSIST)
                 cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}"
             elif len(top_sym_cfgs) >= 1:
                 # Fewer than K valid configs — fall back to single best
