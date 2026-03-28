@@ -56,13 +56,13 @@ TRANSFER_PERSIST = 2             # persistence for single-config WF; ensemble us
 
 # Phase-2 per-stock gate: skip trading if best quick_eval w_score < this
 # Prevents negative-Sharpe contributions from stocks where no config works
-MIN_TRANSFER_SCORE = 0.10        # w_score threshold (Sharpe × trade-count penalty)
+MIN_TRANSFER_SCORE = 0.20        # w_score threshold (Sharpe × trade-count penalty)
 # Phase-2 ensemble: use top-K per-stock configs with majority vote
 TRANSFER_ENSEMBLE_K = 3          # number of configs per stock for voting
-TRANSFER_MAJORITY   = 2          # minimum agreements to fire signal (of K)
+TRANSFER_MAJORITY   = 3          # unanimous: all K configs must agree to fire
 # Phase-2 quick_eval quality floor: configs where win rate is too low are
 # treated as zero (the model is consistently wrong on this stock)
-MIN_WIN_RATE_QUICK_EVAL = 0.38   # min win rate to consider a config usable
+MIN_WIN_RATE_QUICK_EVAL = 0.42   # min win rate to consider a config usable
 
 
 # ─────────────────────────────────────────────────────────────
