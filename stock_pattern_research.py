@@ -62,7 +62,7 @@ TRANSFER_ENSEMBLE_K = 3          # number of configs per stock for voting
 TRANSFER_MAJORITY   = 3          # unanimous: all K configs must agree to fire
 # Phase-2 quick_eval quality floor: configs where win rate is too low are
 # treated as zero (the model is consistently wrong on this stock)
-MIN_WIN_RATE_QUICK_EVAL = 0.38   # min win rate to consider a config usable
+MIN_WIN_RATE_QUICK_EVAL = 0.42   # min win rate to consider a config usable
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1226,16 +1226,16 @@ def _quick_eval_cfg(data: dict, cfg: FeatureConfig, model_name: str,
             # threshold matches what will be applied in the final walk-forward.
             _, m = train_and_evaluate(X_tr, y_tr, X_vl, y_vl, close_vl,
                                       model_name, max(cfg.conf_threshold, TRANSFER_CONF))
-            # Cap score at 0 when win rate is below floor (preserve negative penalty)
-            ws = m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1)
+            # Cap score at 0 when win rate is below floor (model is consistently wrong)
             if m["win_rate"] < MIN_WIN_RATE_QUICK_EVAL and m["n_trades"] >= 3:
-                ws = min(ws, 0.0)  # don't reward low-WR configs, but keep negative
-            split_scores.append(ws)
+                split_scores.append(0.0)
+            else:
+                split_scores.append(m["sharpe"] * min(1.0, m["n_trades"] / MIN_TRADES_P1))
         except Exception:
             return -999.0
 
-    # Average across splits: less conservative than min, fairer to borderline stocks
-    return sum(split_scores) / len(split_scores)
+    # Conservative: take the minimum across both splits
+    return min(split_scores)
 
 
 def phase2_transfer_wf(cfg: FeatureConfig, model_name: str,
