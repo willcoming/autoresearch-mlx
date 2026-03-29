@@ -1,48 +1,52 @@
 #!/usr/bin/env python3
 """
-Phase 2 only — uses pre-selected top configs from Run-26 exploration.
-Skips Phase 1 entirely; should complete in ~10-15 minutes.
+Phase 2 only — checkpoint/resume design.
+Processes one stock at a time, saves result to JSON after each.
+Safe to restart: skips already-completed stocks.
 """
+import json
 import re
 import sys
+import time
+from pathlib import Path
+
 sys.path.insert(0, "/home/user/autoresearch-mlx")
 
 from stock_pattern_research import (
-    FeatureConfig, phase2_transfer_wf, walk_forward_backtest,
-    fetch_stock_data, TEST_SYMBOLS, TRAIN_SYMBOL,
+    FeatureConfig, walk_forward_ensemble, walk_forward_backtest,
+    fetch_stock_data, _quick_eval_cfg,
+    TEST_SYMBOLS, TRAIN_SYMBOL,
     INITIAL_TRAIN_DAYS, STEP_DAYS,
+    TRANSFER_CONF, TRANSFER_ENSEMBLE_K, TRANSFER_MAJORITY, TRANSFER_PERSIST,
+    MIN_TRANSFER_SCORE,
 )
 import numpy as np
 from datetime import datetime
 
+CHECKPOINT_FILE = Path("/tmp/run27_p2_checkpoint.json")
+
 
 def parse_cfg(s: str) -> FeatureConfig:
-    """Parse a config string like 'w[5, 10, 20]|lb20|macd|bb|c0.60'."""
     parts = s.split("|")
-    # windows
-    win_str = parts[0]  # e.g. "w[5, 10, 20]"
-    windows = list(map(int, re.findall(r"\d+", win_str)))
-    lb = 10
-    conf = 0.50
+    windows = list(map(int, re.findall(r"\d+", parts[0])))
+    lb, conf = 10, 0.50
     vol = rsi = macd = bb = atr = trend = stoch = regime = False
     for p in parts[1:]:
-        if p.startswith("lb"):
-            lb = int(p[2:])
-        elif p == "vol":   vol    = True
-        elif p == "rsi":   rsi    = True
-        elif p == "macd":  macd   = True
-        elif p == "bb":    bb     = True
-        elif p == "atr":   atr    = True
-        elif p == "tr":    trend  = True
-        elif p == "stoch": stoch  = True
-        elif p == "reg":   regime = True
-        elif p.startswith("c"):
-            conf = float(p[1:])
+        if p.startswith("lb"):    lb   = int(p[2:])
+        elif p == "vol":          vol    = True
+        elif p == "rsi":          rsi    = True
+        elif p == "macd":         macd   = True
+        elif p == "bb":           bb     = True
+        elif p == "atr":          atr    = True
+        elif p == "tr":           trend  = True
+        elif p == "stoch":        stoch  = True
+        elif p == "reg":          regime = True
+        elif p.startswith("c"):   conf   = float(p[1:])
     return FeatureConfig(windows, vol, rsi, macd, bb, atr, trend,
                          stoch, regime, lookback=lb, conf_threshold=conf)
 
 
-# ── Top-20 configs from Run-26 Phase 1 (n_trades >= 5, ranked by sharpe) ──
+# Top-20 configs from Run-26 Phase 1
 TOP20_RAW = [
     ("w[5, 10, 20]|lb20|macd|bb",          "lr", 2.881),
     ("w[5, 10, 20]|lb20|macd|tr|c0.55",    "lr", 2.754),
@@ -66,54 +70,151 @@ TOP20_RAW = [
     ("w[5, 10, 20]|lb20|atr|tr",           "lr", 2.000),
 ]
 
-# Reconstruct explore_results as list-of-dicts (w_score used for ranking)
-explore_results = []
-for cfg_str, mdl, sharpe in TOP20_RAW:
-    cfg = parse_cfg(cfg_str)
-    explore_results.append({
-        "cfg":          cfg,
-        "model":        mdl,
-        "w_score":      sharpe,   # use Phase-1 sharpe as w_score proxy
-        "sharpe":       sharpe,
-        "n_trades":     20,       # placeholder ≥ 5
-        "total_return": 0.0,
-        "max_drawdown": 0.0,
-        "win_rate":     0.60,
-        "f1":           0.20,
-        "peak_f1":      0.15,
-        "valley_f1":    0.25,
-    })
+explore_results = [
+    {"cfg": parse_cfg(s), "model": m, "w_score": sh,
+     "sharpe": sh, "n_trades": 20, "total_return": 0.0,
+     "max_drawdown": 0.0, "win_rate": 0.60, "f1": 0.20,
+     "peak_f1": 0.15, "valley_f1": 0.25}
+    for s, m, sh in TOP20_RAW
+]
 
 best_cfg   = parse_cfg("w[5, 10, 20]|lb20|macd|bb")
 best_model = "lr"
 
-print("╔══════════════════════════════════════════════════════════════════╗")
-print("║   Phase-2 Only Run  (using Run-26 Phase-1 configs)              ║")
-print(f"║   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  train={TRAIN_SYMBOL}  |  test={len(TEST_SYMBOLS)} stocks          ║")
-print("╚══════════════════════════════════════════════════════════════════╝")
-print(f"\n  Top config : {best_cfg}  [{best_model}]")
-print(f"  Candidate pool : {len(explore_results)} configs loaded from Run-26\n")
+# ── Load checkpoint ───────────────────────────────────────────
+checkpoint: dict[str, dict] = {}
+if CHECKPOINT_FILE.exists():
+    checkpoint = json.loads(CHECKPOINT_FILE.read_text())
+    print(f"  Resuming — {len(checkpoint)} stocks already done: {list(checkpoint.keys())}")
 
-import time
+# ── Build candidate pool (top-20, unique cfg+model, ≥5 trades) ──
+cand_pool: list[tuple] = []
+seen: set[str] = set()
+for r in sorted(explore_results, key=lambda x: -x["w_score"]):
+    key = (str(r["cfg"]), r["model"])
+    if key not in seen:
+        seen.add(key)
+        cand_pool.append((r["cfg"], r["model"]))
+    if len(cand_pool) >= 20:
+        break
+
+print("╔══════════════════════════════════════════════════════════════════╗")
+print("║   Phase-2 Only Run  (Run-27 thresholds, checkpoint/resume)      ║")
+print(f"║   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  test={len(TEST_SYMBOLS)} stocks                        ║")
+print("╚══════════════════════════════════════════════════════════════════╝")
+print(f"\n  MIN_TRANSFER_SCORE={MIN_TRANSFER_SCORE}  TRANSFER_CONF={TRANSFER_CONF}")
+print()
+
+hdr = (f"  {'Symbol':<7}  {'Sharpe':>6}  {'Ret%':>7}  {'DD%':>6}"
+       f"  {'WR%':>5}  {'#T':>3}  {'BnH%':>7}  {'#wins':>5}  cfg")
+print(hdr)
+print("  " + "─" * 70)
+
 t0 = time.time()
 
-transfer_results = phase2_transfer_wf(
-    best_cfg, best_model, TEST_SYMBOLS,
-    explore_results=explore_results,
-)
+for sym in TEST_SYMBOLS:
+    if sym in checkpoint:
+        r = checkpoint[sym]
+        print(f"  {sym:<7}  {r['sharpe']:>6.2f}"
+              f"  {r['total_return']*100:>6.1f}%"
+              f"  {r['max_drawdown']*100:>5.1f}%"
+              f"  {r['win_rate']*100:>4.0f}%"
+              f"  {r['n_trades']:>3}"
+              f"  {r['bnh_return']*100:>6.1f}%"
+              f"  {r.get('n_windows',0):>5}  {r.get('cfg_tag','?')}  [cached]")
+        continue
 
-valid = [r for r in transfer_results if "error" not in r]
-if valid:
+    try:
+        data = fetch_stock_data(sym)
+
+        # Per-stock config selection
+        scores = [(c, m, _quick_eval_cfg(data, c, m)) for c, m in cand_pool]
+        scores.sort(key=lambda x: -x[2])
+        best_c, best_m, best_s = scores[0]
+
+        top_sym_cfgs: list[tuple] = []
+        best_sym_cfg, best_sym_model = best_cfg, best_model
+
+        if best_s >= MIN_TRANSFER_SCORE:
+            best_sym_cfg, best_sym_model = best_c, best_m
+            seen_fam: set[str] = set()
+            for c, m, s in scores:
+                if s <= -999:
+                    continue
+                fam = ("macd"  if c.use_macd  else
+                       "stoch" if c.use_stoch else
+                       "rsi"   if c.use_rsi   else
+                       "bb"    if c.use_bb    else
+                       "atr"   if c.use_atr   else "base")
+                if fam not in seen_fam:
+                    seen_fam.add(fam)
+                    top_sym_cfgs.append((c, m))
+                if len(top_sym_cfgs) >= TRANSFER_ENSEMBLE_K:
+                    break
+
+        # Dynamic confidence: tighten threshold for uncertain transfers
+        sym_conf = TRANSFER_CONF
+        if 0 < best_s < 0.35:
+            sym_conf = TRANSFER_CONF + 0.05
+
+        if len(top_sym_cfgs) >= TRANSFER_ENSEMBLE_K:
+            wf = walk_forward_ensemble(data, top_sym_cfgs,
+                                       conf_threshold=sym_conf,
+                                       majority=TRANSFER_MAJORITY,
+                                       signal_persist=1)
+            cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}"
+        elif len(top_sym_cfgs) >= 1:
+            wf = walk_forward_backtest(data, best_sym_cfg, best_sym_model,
+                                       conf_threshold=sym_conf,
+                                       signal_persist=TRANSFER_PERSIST)
+            cfg_tag = f"[{best_sym_model}]{best_sym_cfg}"
+        else:
+            raw_close = np.array(data["close"])
+            bnh = float((raw_close[-1] - raw_close[INITIAL_TRAIN_DAYS])
+                        / (raw_close[INITIAL_TRAIN_DAYS] + 1e-8))
+            wf = {"sharpe": 0.0, "total_return": 0.0, "max_drawdown": 0.0,
+                  "win_rate": 0.0, "n_trades": 0, "bnh_return": bnh,
+                  "n_oos_days": 0, "n_windows": 0}
+            cfg_tag = "SKIP"
+
+        print(f"  {sym:<7}  {wf['sharpe']:>6.2f}"
+              f"  {wf['total_return']*100:>6.1f}%"
+              f"  {wf['max_drawdown']*100:>5.1f}%"
+              f"  {wf['win_rate']*100:>4.0f}%"
+              f"  {wf['n_trades']:>3}"
+              f"  {wf['bnh_return']*100:>6.1f}%"
+              f"  {wf.get('n_windows',0):>5}  {cfg_tag}"
+              f"  [best_s={best_s:.3f}]")
+
+        # Save checkpoint
+        checkpoint[sym] = {**wf, "cfg_tag": cfg_tag, "best_s": best_s}
+        CHECKPOINT_FILE.write_text(json.dumps(checkpoint))
+
+    except Exception as e:
+        print(f"  {sym:<7}  ERROR: {e}")
+
+# ── Final summary (only when all stocks done) ──────────────────
+if len(checkpoint) == len(TEST_SYMBOLS):
+    valid = [v for v in checkpoint.values() if v.get("cfg_tag") != "ERROR"]
     avg_sh  = sum(r["sharpe"]       for r in valid) / len(valid)
     avg_ret = sum(r["total_return"] for r in valid) / len(valid)
-    best_s  = max(valid, key=lambda r: r["sharpe"])
-    worst_s = min(valid, key=lambda r: r["sharpe"])
+    best_s_sym  = max(checkpoint.items(), key=lambda x: x[1]["sharpe"])
+    worst_s_sym = min(checkpoint.items(), key=lambda x: x[1]["sharpe"])
     print(f"\n{'═'*68}")
     print("  FINAL SUMMARY  (Walk-Forward — full 4 years OOS)")
     print(f"{'═'*68}")
-    print(f"  ── Transfer-test ({len(valid)} stocks, 4yr walk-forward) ──")
     print(f"  Avg Sharpe       : {avg_sh:.3f}")
     print(f"  Avg return       : {avg_ret*100:.1f}%")
-    print(f"  Best  stock      : {best_s['symbol']}  (Sharpe={best_s['sharpe']:.2f})")
-    print(f"  Worst stock      : {worst_s['symbol']}  (Sharpe={worst_s['sharpe']:.2f})")
+    print(f"  Best  stock      : {best_s_sym[0]}  (Sharpe={best_s_sym[1]['sharpe']:.2f})")
+    print(f"  Worst stock      : {worst_s_sym[0]}  (Sharpe={worst_s_sym[1]['sharpe']:.2f})")
     print(f"  Total time       : {time.time()-t0:.1f}s")
+    print(f"\n  Per-stock results:")
+    for sym in TEST_SYMBOLS:
+        r = checkpoint[sym]
+        print(f"    {sym:<6} Sharpe={r['sharpe']:.2f}  ret={r['total_return']*100:.1f}%"
+              f"  tag={r.get('cfg_tag','?')}  best_s={r.get('best_s',0):.3f}")
+else:
+    done = list(checkpoint.keys())
+    remaining = [s for s in TEST_SYMBOLS if s not in checkpoint]
+    print(f"\n  Checkpoint saved: {done}")
+    print(f"  Remaining: {remaining} — re-run script to continue.")
