@@ -46,7 +46,9 @@ def parse_cfg(s: str) -> FeatureConfig:
                          stoch, regime, lookback=lb, conf_threshold=conf)
 
 
-# Top-20 configs from Run-26 Phase 1
+# Top-20 configs from Run-26 Phase 1 + slow-cycle configs for MSFT (cycle=90d)
+# Slow-cycle entries use w[10,20,50] with lb=30-40 to capture longer patterns.
+# They are given placeholder w_scores so quick_eval decides if they're useful.
 TOP20_RAW = [
     ("w[5, 10, 20]|lb20|macd|bb",          "lr", 2.881),
     ("w[5, 10, 20]|lb20|macd|tr|c0.55",    "lr", 2.754),
@@ -68,6 +70,12 @@ TOP20_RAW = [
     ("w[5, 10, 20]|lb14|rsi|atr|c0.55",    "lr", 2.100),
     ("w[5, 10, 20]|lb14|rsi",              "lr", 2.022),
     ("w[5, 10, 20]|lb20|atr|tr",           "lr", 2.000),
+    # ── Slow-cycle configs (for MSFT cycle=90d) ─────────────────
+    ("w[10, 20, 50]|lb30|macd|bb",         "lr", 1.900),
+    ("w[10, 20, 50]|lb40|macd|bb",         "lr", 1.850),
+    ("w[10, 20, 50]|lb30|macd",            "lr", 1.800),
+    ("w[10, 20, 50]|lb30|rsi|macd",        "lr", 1.750),
+    ("w[10, 20, 50]|lb40|macd|tr",         "lr", 1.700),
 ]
 
 explore_results = [
