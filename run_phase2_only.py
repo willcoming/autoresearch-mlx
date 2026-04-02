@@ -169,8 +169,8 @@ for sym in TEST_SYMBOLS:
             wf = walk_forward_ensemble(data, top_sym_cfgs,
                                        conf_threshold=sym_conf,
                                        majority=TRANSFER_MAJORITY,
-                                       signal_persist=1)
-            cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}"
+                                       signal_persist=2)
+            cfg_tag = f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}p2"
         elif len(top_sym_cfgs) >= 1:
             wf = walk_forward_backtest(data, best_sym_cfg, best_sym_model,
                                        conf_threshold=sym_conf,
