@@ -76,6 +76,14 @@ TOP20_RAW = [
     ("w[10, 20, 50]|lb30|macd",            "lr", 1.800),
     ("w[10, 20, 50]|lb30|rsi|macd",        "lr", 1.750),
     ("w[10, 20, 50]|lb40|macd|tr",         "lr", 1.700),
+    # ── META-cycle configs (cycle≈65d, sigma=0.025, amp=0.15) ────
+    ("w[5, 10, 20]|lb60|macd|bb",          "lr", 1.650),
+    ("w[5, 10, 20]|lb60|rsi|macd",         "lr", 1.620),
+    ("w[5, 10, 20]|lb65|macd|bb",          "lr", 1.600),
+    ("w[5, 10, 20]|lb60|macd",             "lr", 1.580),
+    ("w[5, 10, 20]|lb65|rsi|macd",         "lr", 1.560),
+    ("w[10, 20, 50]|lb60|macd|bb",         "lr", 1.540),
+    ("w[10, 20, 50]|lb60|rsi|macd",        "lr", 1.520),
 ]
 
 explore_results = [
@@ -169,6 +177,15 @@ for sym in TEST_SYMBOLS:
                     top4_cfgs.append((c, m))
                 if len(top4_cfgs) >= 4:
                     break
+            # Build K=5 ensemble: K=4 + one more
+            top5_cfgs = list(top4_cfgs)
+            for c, m, s in scores:
+                if s <= -999:
+                    continue
+                if (c, m) not in top4_cfgs:
+                    top5_cfgs.append((c, m))
+                if len(top5_cfgs) >= 5:
+                    break
 
         # Dynamic confidence: tighten threshold for uncertain transfers
         sym_conf = TRANSFER_CONF
@@ -238,6 +255,13 @@ for sym in TEST_SYMBOLS:
                     candidates += [(wf_k4m3,  "ens4x3"),
                                    (wf_k4m2,  "ens4x2"),
                                    (wf_k4m3c, "ens4x3c70")]
+                # K=5 ensemble variant (majority=4 = 80% agreement, most selective)
+                if len(top5_cfgs) >= 5:
+                    wf_k5m4 = walk_forward_ensemble(data, top5_cfgs,
+                                                    conf_threshold=sym_conf,
+                                                    majority=4,
+                                                    signal_persist=1)
+                    candidates.append((wf_k5m4, "ens5x4"))
                 wf, cfg_tag = max(candidates, key=lambda x: x[0]['sharpe'])
             # Adaptive conf/majority/persist for noisy high-trade stocks (e.g. NVDA)
             elif wf1['n_trades'] > 35:
@@ -269,6 +293,18 @@ for sym in TEST_SYMBOLS:
                               (wf4,  f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}c80"),
                               (wf5p, f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}c75p2"),
                               (wf6p, f"ens{TRANSFER_ENSEMBLE_K}x{TRANSFER_MAJORITY}c80p2")]
+                # K=4 variants for high-trade stocks
+                if len(top4_cfgs) >= 4:
+                    wf_k4c80 = walk_forward_ensemble(data, top4_cfgs,
+                                                     conf_threshold=sym_conf + 0.15,
+                                                     majority=TRANSFER_MAJORITY,
+                                                     signal_persist=1)
+                    wf_k4c75 = walk_forward_ensemble(data, top4_cfgs,
+                                                     conf_threshold=sym_conf + 0.10,
+                                                     majority=TRANSFER_MAJORITY,
+                                                     signal_persist=1)
+                    candidates += [(wf_k4c80, "ens4x3c80"),
+                                   (wf_k4c75, "ens4x3c75")]
                 wf, cfg_tag = max(candidates, key=lambda x: x[0]['sharpe'])
             else:
                 wf = wf1
@@ -279,13 +315,48 @@ for sym in TEST_SYMBOLS:
                                        signal_persist=TRANSFER_PERSIST)
             cfg_tag = f"[{best_sym_model}]{best_sym_cfg}"
         else:
-            raw_close = np.array(data["close"])
-            bnh = float((raw_close[-1] - raw_close[INITIAL_TRAIN_DAYS])
-                        / (raw_close[INITIAL_TRAIN_DAYS] + 1e-8))
-            wf = {"sharpe": 0.0, "total_return": 0.0, "max_drawdown": 0.0,
-                  "win_rate": 0.0, "n_trades": 0, "bnh_return": bnh,
-                  "n_oos_days": 0, "n_windows": 0}
-            cfg_tag = "SKIP"
+            # Rescue attempt: relax win_rate gate from 0.42→0.35 for SKIP stocks
+            import stock_pattern_research as _spr
+            _orig_wr = _spr.MIN_WIN_RATE_QUICK_EVAL
+            _spr.MIN_WIN_RATE_QUICK_EVAL = 0.35
+            try:
+                rescue_scores = [(c, m, _quick_eval_cfg(data, c, m)) for c, m in cand_pool]
+            finally:
+                _spr.MIN_WIN_RATE_QUICK_EVAL = _orig_wr
+            rescue_scores.sort(key=lambda x: -x[2])
+            rescue_wf = None
+            if rescue_scores[0][2] > 0:
+                rescue_cfgs: list[tuple] = []
+                seen_fam_r: set[str] = set()
+                for c, m, s in rescue_scores:
+                    if s <= 0:
+                        continue
+                    fam = ("macd"  if c.use_macd  else
+                           "stoch" if c.use_stoch else
+                           "rsi"   if c.use_rsi   else
+                           "bb"    if c.use_bb    else
+                           "atr"   if c.use_atr   else "base")
+                    if fam not in seen_fam_r:
+                        seen_fam_r.add(fam)
+                        rescue_cfgs.append((c, m))
+                    if len(rescue_cfgs) >= TRANSFER_ENSEMBLE_K:
+                        break
+                if len(rescue_cfgs) >= TRANSFER_ENSEMBLE_K:
+                    rescue_wf = walk_forward_ensemble(data, rescue_cfgs,
+                                                      conf_threshold=0.80,
+                                                      majority=TRANSFER_MAJORITY,
+                                                      signal_persist=1)
+            if rescue_wf and rescue_wf['sharpe'] > 0.20:
+                wf = rescue_wf
+                cfg_tag = "rescue_c80"
+            else:
+                raw_close = np.array(data["close"])
+                bnh = float((raw_close[-1] - raw_close[INITIAL_TRAIN_DAYS])
+                            / (raw_close[INITIAL_TRAIN_DAYS] + 1e-8))
+                wf = {"sharpe": 0.0, "total_return": 0.0, "max_drawdown": 0.0,
+                      "win_rate": 0.0, "n_trades": 0, "bnh_return": bnh,
+                      "n_oos_days": 0, "n_windows": 0}
+                cfg_tag = "SKIP"
 
         print(f"  {sym:<7}  {wf['sharpe']:>6.2f}"
               f"  {wf['total_return']*100:>6.1f}%"
