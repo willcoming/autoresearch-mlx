@@ -272,8 +272,18 @@ for sym in TEST_SYMBOLS:
                                                       conf_threshold=sym_conf - 0.10,
                                                       majority=TRANSFER_MAJORITY,
                                                       signal_persist=1)
+                    wf_c60_k3 = walk_forward_ensemble(data, top_sym_cfgs,
+                                                      conf_threshold=sym_conf - 0.05,
+                                                      majority=TRANSFER_MAJORITY,
+                                                      signal_persist=1)
+                    wf_c55_k3 = walk_forward_ensemble(data, top_sym_cfgs,
+                                                      conf_threshold=sym_conf - 0.10,
+                                                      majority=TRANSFER_MAJORITY,
+                                                      signal_persist=1)
                     candidates += [(wf_c60_k4, "ens4x3c60"),
-                                   (wf_c55_k4, "ens4x3c55")]
+                                   (wf_c55_k4, "ens4x3c55"),
+                                   (wf_c60_k3, "ens3x3c60"),
+                                   (wf_c55_k3, "ens3x3c55")]
                 wf, cfg_tag = max(candidates, key=lambda x: x[0]['sharpe'])
             # Adaptive conf/majority/persist for noisy high-trade stocks (e.g. NVDA)
             elif wf1['n_trades'] > 35:
