@@ -291,10 +291,25 @@ for sym in TEST_SYMBOLS:
                                                       conf_threshold=sym_conf - 0.10,
                                                       majority=TRANSFER_MAJORITY,
                                                       signal_persist=1)
+                    # persist=2 + lower-conf (c60): for high-WR stocks that benefit from
+                    # both signal filtering and relaxed entry threshold (e.g. MSFT)
+                    wf_c60_p2 = walk_forward_ensemble(data, top_sym_cfgs,
+                                                      conf_threshold=sym_conf - 0.05,
+                                                      majority=TRANSFER_MAJORITY,
+                                                      signal_persist=2)
                     candidates += [(wf_c60_k4, "ens4x3c60"),
                                    (wf_c55_k4, "ens4x3c55"),
                                    (wf_c60_k3, "ens3x3c60"),
-                                   (wf_c55_k3, "ens3x3c55")]
+                                   (wf_c55_k3, "ens3x3c55"),
+                                   (wf_c60_p2, "ens3x3c60p2")]
+                    # K=4/majority=4 (unanimous 4-way) + conf=0.60: most selective
+                    # ensemble for high-WR diversified stocks (e.g. AAPL)
+                    if len(top4_cfgs) >= 4:
+                        wf_k4m4c60 = walk_forward_ensemble(data, top4_cfgs,
+                                                            conf_threshold=sym_conf - 0.05,
+                                                            majority=4,
+                                                            signal_persist=1)
+                        candidates.append((wf_k4m4c60, "ens4x4c60"))
                 wf, cfg_tag = max(candidates, key=lambda x: x[0]['sharpe'])
             # Adaptive conf/majority/persist for noisy high-trade stocks (e.g. NVDA)
             elif wf1['n_trades'] > 35:
